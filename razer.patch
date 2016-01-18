@@ -1,0 +1,135 @@
+diff --git a/drivers/acpi/button.c b/drivers/acpi/button.c
+index 6d5d183..6d583ad 100644
+--- a/drivers/acpi/button.c
++++ b/drivers/acpi/button.c
+@@ -32,6 +32,7 @@
+ #include <linux/input.h>
+ #include <linux/slab.h>
+ #include <linux/acpi.h>
++#include <linux/dmi.h>
+ #include <acpi/button.h>
+ 
+ #define PREFIX "ACPI: "
+@@ -105,11 +106,14 @@ struct acpi_button {
+ 	char phys[32];			/* for input device */
+ 	unsigned long pushed;
+ 	bool suspended;
++	unsigned long long cache_state;
+ };
+ 
+ static BLOCKING_NOTIFIER_HEAD(acpi_lid_notifier);
+ static struct acpi_device *lid_device;
+ 
++static int LID_CACHE_STATE = 0;		/* override for buggy BIOSes, right now Razer Blade 14" */
++
+ /* --------------------------------------------------------------------------
+                               FS Interface (/proc)
+    -------------------------------------------------------------------------- */
+@@ -122,8 +126,13 @@ static int acpi_button_state_seq_show(struct seq_file *seq, void *offset)
+ 	struct acpi_device *device = seq->private;
+ 	acpi_status status;
+ 	unsigned long long state;
++	struct acpi_button *button = acpi_driver_data(device);
+ 
+ 	status = acpi_evaluate_integer(device->handle, "_LID", NULL, &state);
++	if (!button)
++		return 0;
++	if (LID_CACHE_STATE)
++		state = button->cache_state;
+ 	seq_printf(seq, "state:      %s\n",
+ 		   ACPI_FAILURE(status) ? "unsupported" :
+ 			(state ? "open" : "closed"));
+@@ -237,15 +246,22 @@ int acpi_lid_open(void)
+ {
+ 	acpi_status status;
+ 	unsigned long long state;
++	struct acpi_button *button;
+ 
+ 	if (!lid_device)
+ 		return -ENODEV;
+ 
++	button = acpi_driver_data(lid_device);
++	if (!button)
++		return -ENODEV;
+ 	status = acpi_evaluate_integer(lid_device->handle, "_LID", NULL,
+ 				       &state);
+ 	if (ACPI_FAILURE(status))
+ 		return -ENODEV;
+ 
++	if (LID_CACHE_STATE)
++		button->cache_state = !!state;
++
+ 	return !!state;
+ }
+ EXPORT_SYMBOL(acpi_lid_open);
+@@ -261,6 +277,9 @@ static int acpi_lid_send_state(struct acpi_device *device)
+ 	if (ACPI_FAILURE(status))
+ 		return -ENODEV;
+ 
++	if (LID_CACHE_STATE)
++		state = button->cache_state;
++
+ 	/* input layer checks if event is redundant */
+ 	input_report_switch(button->input, SW_LID, !state);
+ 	input_sync(button->input);
+@@ -294,6 +313,10 @@ static void acpi_button_notify(struct acpi_device *device, u32 event)
+ 	case ACPI_BUTTON_NOTIFY_STATUS:
+ 		input = button->input;
+ 		if (button->type == ACPI_BUTTON_TYPE_LID) {
++
++			if (LID_CACHE_STATE)
++				button->cache_state = !button->cache_state;
++
+ 			acpi_lid_send_state(device);
+ 		} else {
+ 			int keycode;
+@@ -329,6 +352,10 @@ static int acpi_button_suspend(struct device *dev)
+ 	struct acpi_button *button = acpi_driver_data(device);
+ 
+ 	button->suspended = true;
++
++	if (LID_CACHE_STATE)
++		button->cache_state = 0;
++
+ 	return 0;
+ }
+ 
+@@ -338,8 +365,13 @@ static int acpi_button_resume(struct device *dev)
+ 	struct acpi_button *button = acpi_driver_data(device);
+ 
+ 	button->suspended = false;
+-	if (button->type == ACPI_BUTTON_TYPE_LID)
++	if (button->type == ACPI_BUTTON_TYPE_LID) {
++
++		if (LID_CACHE_STATE)
++			button->cache_state = 1;
++
+ 		return acpi_lid_send_state(device);
++	}
+ 	return 0;
+ }
+ #endif
+@@ -384,6 +416,12 @@ static int acpi_button_add(struct acpi_device *device)
+ 		strcpy(name, ACPI_BUTTON_DEVICE_NAME_LID);
+ 		sprintf(class, "%s/%s",
+ 			ACPI_BUTTON_CLASS, ACPI_BUTTON_SUBCLASS_LID);
++
++		if (dmi_name_in_vendors("RAZER")) {
++			printk("***** using LID_CACHE_STATE for BIOS work around\n");
++			LID_CACHE_STATE = 1;
++		}
++
+ 	} else {
+ 		printk(KERN_ERR PREFIX "Unsupported hid [%s]\n", hid);
+ 		error = -ENODEV;
+@@ -420,6 +458,10 @@ static int acpi_button_add(struct acpi_device *device)
+ 	if (error)
+ 		goto err_remove_fs;
+ 	if (button->type == ACPI_BUTTON_TYPE_LID) {
++
++		if (LID_CACHE_STATE)
++			button->cache_state = 1;
++
+ 		acpi_lid_send_state(device);
+ 		/*
+ 		 * This assumes there's only one lid device, or if there are
